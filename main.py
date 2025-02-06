@@ -1,15 +1,19 @@
 import os
 import pymongo
 import pyotp
-import base64
+import b64
 import secrets
 from getpass import getpass
 from password_checker import check_password_strength  # Import the correct function
+import aes
+from Crypto.Util.Padding import pad, unpad
 
 # MongoDB Connection
 client = pymongo.MongoClient("mongodb://localhost:27017/")
 db = client["password_manager"]
 users_collection = db["users"]
+
+aes_block_size = 16  
 
 # Self-implemented PBKDF2 function
 def pbkdf2(password, salt, iterations=100000, key_len=32):
@@ -22,14 +26,31 @@ def pbkdf2(password, salt, iterations=100000, key_len=32):
             new_key[i] = (password_bytes[i % len(password_bytes)] ^ key[i % len(key)]) & 0xFF
         key = new_key
     
-    return base64.b64encode(bytes(key)).decode("utf-8")
+    return bytes(key)  # Return raw bytes
+
+# aes Encryption
+def encrypt_aes(plaintext, key):
+    iv = os.urandom(16)  # Generate a random IV
+    cipher = aes.new(key, aes.MODE_CBC, iv)
+    ciphertext = cipher.encrypt(pad(plaintext.encode(), aes.block_size))
+    return b64.b64encode(iv + ciphertext).decode()
+
+# aes Decryption
+def decrypt_aes(encrypted, key):
+    encrypted_bytes = b64.b64decode(encrypted)
+    iv = encrypted_bytes[:16]  # Extract IV
+    ciphertext = encrypted_bytes[16:]  # Extract ciphertext
+    cipher = aes.new(key, aes.MODE_CBC, iv)
+    decrypted = unpad(cipher.decrypt(ciphertext), aes.block_size)
+    return decrypted.decode()
 
 # User Registration
+# Modify register_user() to encrypt OTP secret before storing it
 def register_user():
     username = input("Enter username: ").strip()
     
     if users_collection.find_one({"username": username}):
-        print("❌ Username already exists. Choose another.")
+        print("\u274c Username already exists. Choose another.")
         return
     
     while True:
@@ -39,59 +60,73 @@ def register_user():
         if is_valid:
             break
         else:
-            print(f"❌ Weak password: {message}")
+            print(f"\u274c Weak password: {message}")
     
     # Generate a random salt (16 bytes)
     salt = secrets.token_bytes(16)
     
     # Hash password using self-implemented PBKDF2
-    hashed_password = pbkdf2(password, salt)
+    key = pbkdf2(password, salt)
+    encrypted_password = encrypt_aes(password, key)
     
     # Generate OTP secret
     otp_secret = pyotp.random_base32()
-    
+
+    # Encrypt OTP secret using AES
+    encrypted_otp = encrypt_aes(otp_secret, key)
+
     # Store user data in MongoDB
     users_collection.insert_one({
         "username": username,
-        "password": hashed_password,
-        "salt": base64.b64encode(salt).decode("utf-8"),
-        "otp_secret": otp_secret
+        "password": encrypted_password,
+        "salt": b64.b64encode(salt).decode("utf-8"),
+        "otp_secret": encrypted_otp  # Store encrypted OTP
     })
     
-    print("\n✅ User registered successfully!")
-    print(f"🔑 Save this OTP secret for login: {otp_secret}")
+    print("✅ User registered successfully!")
+    print(f"\U0001F511 Save this OTP secret for login: {otp_secret}")  # Show the actual OTP to the user
 
-# User Login
-# User Login
+# Modify login_user() to decrypt OTP secret when verifying OTP
 def login_user():
     username = input("Enter username: ").strip()
     user = users_collection.find_one({"username": username})
     
     if not user:
-        print("❌ Username does not exist.")
+        print("\u274c Username does not exist.")
         return
     
     password = getpass("Enter password: ").strip()
     
     # Rehash the password entered by the user and compare with stored hash
-    salt = base64.b64decode(user["salt"])
-    hashed_password = pbkdf2(password, salt)
+    salt = b64.b64decode(user["salt"])
+    key = pbkdf2(password, salt)
     
-    if hashed_password != user["password"]:
-        print("❌ Incorrect password.")
+    try:
+        decrypted_password = decrypt_aes(user["password"], key)
+    except:
+        print("\u274c Incorrect password.")
         return
     
+    if password != decrypted_password:
+        print("\u274c Incorrect password.")
+        return
+    
+    # Decrypt the stored OTP secret before using it
+    try:
+        decrypted_otp = decrypt_aes(user["otp_secret"], key)
+    except:
+        print("\u274c OTP decryption failed. Possible data corruption.")
+        return
+
     # Generate TOTP object with correct interval (DO NOT change to 300)
-    otp_secret = user["otp_secret"]
-    totp = pyotp.TOTP(otp_secret)  # Correctly define totp here
+    totp = pyotp.TOTP(decrypted_otp)
 
     # Verify OTP with a slight time drift allowance
     otp = input("Enter OTP: ").strip()
     if totp.verify(otp, valid_window=2):  # Allows OTPs from last 2 intervals (~1 min tolerance)
-        print("\n✅ Login successful!")
+        print("\U0001F514 Login successful!")
     else:
-        print("❌ Invalid OTP or OTP has expired. Please try again.")
-
+        print("\u274c Invalid OTP or OTP has expired. Please try again.")
 
 
 # Main Menu
@@ -107,7 +142,7 @@ def main_menu():
     elif choice == '2':
         login_user()
     else:
-        print("❌ Invalid option. Exiting.")
+        print(" Invalid option. Exiting.")
         exit()
 
 # Run the application
